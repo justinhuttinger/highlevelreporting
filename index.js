@@ -13,7 +13,6 @@ const CONFIG = {
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     credentialsJson: process.env.GOOGLE_CREDENTIALS
   },
-  // Each location with its own API key environment variable
   locations: [
     { id: 'xXV3CXt5DkgfGnTt8CG1', name: 'Springfield', apiKeyEnv: 'GHL_API_KEY_SPRINGFIELD' },
     { id: 'uflpfHNpByAnaBLkQzu3', name: 'Salem', apiKeyEnv: 'GHL_API_KEY_SALEM' },
@@ -22,7 +21,6 @@ const CONFIG = {
     { id: 'aqSDfuZLimMXuPz6Zx3p', name: 'Clackamas', apiKeyEnv: 'GHL_API_KEY_CLACKAMAS' },
     { id: 'BQfUepBFzqVan4ruCQ6R', name: 'Milwaukie', apiKeyEnv: 'GHL_API_KEY_MILWAUKIE' }
   ],
-  // Custom field keys (from GHL contact object)
   customFields: {
     saleTeamMember: 'sale_team_member',
     tourTeamMember: 'tour_team_member',
@@ -51,57 +49,105 @@ class GHLClient {
 
   async getContacts(locationId, locationName, startDate) {
     const contacts = [];
-    let nextPageUrl = null;
+    const seenIds = new Set(); // Track IDs to detect loops
+    let startAfterId = null;
     let page = 1;
 
     console.log(`  Fetching contacts for ${locationName}...`);
 
-    do {
+    while (true) {
       try {
         const params = {
           locationId,
           limit: 100
         };
 
-        if (nextPageUrl) {
-          params.startAfterId = nextPageUrl;
+        // Use startAfterId for pagination (cursor-based)
+        if (startAfterId) {
+          params.startAfterId = startAfterId;
         }
 
         const response = await this.client.get('/contacts/', { params });
         const data = response.data;
 
-        if (data.contacts && data.contacts.length > 0) {
-          // Filter by date and tag
-          const filtered = data.contacts.filter(contact => {
-            const createdAt = new Date(contact.dateAdded || contact.createdAt);
-            const hasTag = contact.tags && contact.tags.some(t => 
-              t.toLowerCase() === CONFIG.saleTag.toLowerCase()
-            );
-            return createdAt >= startDate && hasTag;
-          });
-
-          contacts.push(...filtered);
-          console.log(`    Page ${page}: Found ${data.contacts.length} contacts, ${filtered.length} with sale tag in date range`);
+        // Check if we got contacts
+        if (!data.contacts || data.contacts.length === 0) {
+          console.log(`    Page ${page}: No more contacts`);
+          break;
         }
 
-        nextPageUrl = data.meta?.nextPageUrl || data.meta?.startAfterId || null;
+        // Check for infinite loop - if first contact was already seen, we're looping
+        const firstContactId = data.contacts[0].id;
+        if (seenIds.has(firstContactId)) {
+          console.log(`    Page ${page}: Detected loop (duplicate contacts), stopping`);
+          break;
+        }
+
+        // Track all IDs from this page
+        let duplicatesInPage = 0;
+        data.contacts.forEach(c => {
+          if (seenIds.has(c.id)) {
+            duplicatesInPage++;
+          }
+          seenIds.add(c.id);
+        });
+
+        if (duplicatesInPage > 50) {
+          console.log(`    Page ${page}: Too many duplicates (${duplicatesInPage}), stopping`);
+          break;
+        }
+
+        // Filter by date and tag
+        const filtered = data.contacts.filter(contact => {
+          const createdAt = new Date(contact.dateAdded || contact.createdAt);
+          const hasTag = contact.tags && contact.tags.some(t => 
+            t.toLowerCase() === CONFIG.saleTag.toLowerCase()
+          );
+          return createdAt >= startDate && hasTag;
+        });
+
+        contacts.push(...filtered);
+        
+        console.log(`    Page ${page}: ${data.contacts.length} contacts, ${filtered.length} with sale tag in date range (total collected: ${contacts.length})`);
+
+        // Get the cursor for next page - use the LAST contact's ID
+        const lastContact = data.contacts[data.contacts.length - 1];
+        const newStartAfterId = lastContact?.id;
+
+        // If no new cursor or same as before, we're done
+        if (!newStartAfterId || newStartAfterId === startAfterId) {
+          console.log(`    No more pages (cursor unchanged)`);
+          break;
+        }
+
+        startAfterId = newStartAfterId;
         page++;
 
         // Rate limiting
         await this.sleep(100);
 
+        // Safety limit
+        if (page > 500) {
+          console.log(`    Safety limit reached (500 pages)`);
+          break;
+        }
+
       } catch (error) {
         console.error(`  Error fetching contacts: ${error.message}`);
+        if (error.response?.data) {
+          console.error(`  Response: ${JSON.stringify(error.response.data)}`);
+        }
         if (error.response?.status === 429) {
           console.log('  Rate limited, waiting 60 seconds...');
           await this.sleep(60000);
         } else {
-          throw error;
+          break;
         }
       }
-    } while (nextPageUrl);
+    }
 
     console.log(`  Total contacts found for ${locationName}: ${contacts.length}`);
+    console.log(`  Total unique contacts scanned: ${seenIds.size}`);
     return contacts;
   }
 
@@ -133,7 +179,6 @@ class SheetsClient {
   async clearAndWriteData(sheetName, data) {
     const sheets = await this.getSheets();
     
-    // Clear existing data (keep header row)
     await sheets.spreadsheets.values.clear({
       spreadsheetId: this.spreadsheetId,
       range: `${sheetName}!A2:Z10000`
@@ -144,7 +189,6 @@ class SheetsClient {
       return;
     }
 
-    // Write new data
     await sheets.spreadsheets.values.update({
       spreadsheetId: this.spreadsheetId,
       range: `${sheetName}!A2`,
@@ -161,10 +205,8 @@ class SheetsClient {
 // ============================================
 function transformContactToRow(contact, locationName) {
   const getCustomField = (fieldName) => {
-    // Try direct property access first
     if (contact[fieldName]) return contact[fieldName];
     
-    // Try customFields array
     if (contact.customFields) {
       const field = contact.customFields.find(f => 
         f.key === fieldName || 
@@ -221,18 +263,15 @@ async function syncGHLToSheets() {
   console.log(`Started at: ${new Date().toISOString()}`);
   console.log('========================================\n');
 
-  // Validate environment variables
   if (!CONFIG.google.spreadsheetId) throw new Error('GOOGLE_SHEET_ID not set');
   if (!CONFIG.google.credentialsJson) throw new Error('GOOGLE_CREDENTIALS not set');
 
   const sheets = new SheetsClient(CONFIG.google.credentialsJson, CONFIG.google.spreadsheetId);
 
-  // Calculate date range
   const startDate = new Date();
   startDate.setDate(startDate.getDate() - CONFIG.daysBack);
   console.log(`Fetching contacts from ${startDate.toISOString().split('T')[0]} to today\n`);
 
-  // Fetch contacts from all locations
   const allRows = [];
 
   for (const location of CONFIG.locations) {
@@ -260,11 +299,9 @@ async function syncGHLToSheets() {
   console.log(`Total contacts across all locations: ${allRows.length}`);
   console.log(`----------------------------------------\n`);
 
-  // Write to Google Sheets
   console.log('Writing to Google Sheets...');
   await sheets.clearAndWriteData('Raw Data', allRows);
 
-  // Extract and update team members lists
   const { saleMembers, tourMembers } = extractUniqueTeamMembers(allRows);
   console.log(`\nUnique Sale Team Members: ${saleMembers.join(', ') || '(none)'}`);
   console.log(`Unique Tour Team Members: ${tourMembers.join(', ') || '(none)'}`);
@@ -274,9 +311,6 @@ async function syncGHLToSheets() {
   console.log('========================================');
 }
 
-// ============================================
-// RUN
-// ============================================
 syncGHLToSheets()
   .then(() => process.exit(0))
   .catch(error => {
