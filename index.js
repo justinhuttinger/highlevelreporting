@@ -49,7 +49,10 @@ class GHLClient {
 
   async getContacts(locationId, locationName, startDate) {
     const contacts = [];
-    const seenIds = new Set(); // Track IDs to detect loops
+    const seenIds = new Set();
+    
+    // Pagination cursors - must use BOTH from meta response
+    let startAfter = null;
     let startAfterId = null;
     let page = 1;
 
@@ -62,8 +65,9 @@ class GHLClient {
           limit: 100
         };
 
-        // Use startAfterId for pagination (cursor-based)
-        if (startAfterId) {
+        // GHL requires BOTH startAfter and startAfterId for pagination
+        if (startAfter !== null && startAfterId !== null) {
+          params.startAfter = startAfter;
           params.startAfterId = startAfterId;
         }
 
@@ -76,26 +80,15 @@ class GHLClient {
           break;
         }
 
-        // Check for infinite loop - if first contact was already seen, we're looping
+        // Check for duplicates (loop detection)
         const firstContactId = data.contacts[0].id;
         if (seenIds.has(firstContactId)) {
-          console.log(`    Page ${page}: Detected loop (duplicate contacts), stopping`);
+          console.log(`    Page ${page}: Detected loop (saw ${firstContactId} before), stopping`);
           break;
         }
 
-        // Track all IDs from this page
-        let duplicatesInPage = 0;
-        data.contacts.forEach(c => {
-          if (seenIds.has(c.id)) {
-            duplicatesInPage++;
-          }
-          seenIds.add(c.id);
-        });
-
-        if (duplicatesInPage > 50) {
-          console.log(`    Page ${page}: Too many duplicates (${duplicatesInPage}), stopping`);
-          break;
-        }
+        // Track all IDs from this batch
+        data.contacts.forEach(c => seenIds.add(c.id));
 
         // Filter by date and tag
         const filtered = data.contacts.filter(contact => {
@@ -108,18 +101,25 @@ class GHLClient {
 
         contacts.push(...filtered);
         
-        console.log(`    Page ${page}: ${data.contacts.length} contacts, ${filtered.length} with sale tag in date range (total collected: ${contacts.length})`);
+        console.log(`    Page ${page}: ${data.contacts.length} contacts, ${filtered.length} with sale tag in range (total: ${contacts.length})`);
 
-        // Get the cursor for next page - use the LAST contact's ID
-        const lastContact = data.contacts[data.contacts.length - 1];
-        const newStartAfterId = lastContact?.id;
+        // Get pagination cursors from meta - BOTH are required
+        const newStartAfter = data.meta?.startAfter;
+        const newStartAfterId = data.meta?.startAfterId;
 
-        // If no new cursor or same as before, we're done
-        if (!newStartAfterId || newStartAfterId === startAfterId) {
+        // If no cursors returned, we're done
+        if (!newStartAfter && !newStartAfterId) {
+          console.log(`    No more pages (no cursor in response)`);
+          break;
+        }
+
+        // If cursors haven't changed, we're done
+        if (newStartAfter === startAfter && newStartAfterId === startAfterId) {
           console.log(`    No more pages (cursor unchanged)`);
           break;
         }
 
+        startAfter = newStartAfter;
         startAfterId = newStartAfterId;
         page++;
 
@@ -127,8 +127,8 @@ class GHLClient {
         await this.sleep(100);
 
         // Safety limit
-        if (page > 500) {
-          console.log(`    Safety limit reached (500 pages)`);
+        if (page > 200) {
+          console.log(`    Safety limit reached (200 pages = ~20,000 contacts)`);
           break;
         }
 
