@@ -1,0 +1,18 @@
+# render.yaml - Render Blueprint for WCS GHL Sync
+
+services:
+  - type: cron
+    name: wcs-ghl-sheets-sync
+    runtime: node
+    schedule: "0 10 * * *"  # 3am Pacific = 10:00 UTC
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GHL_API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: GOOGLE_SHEET_ID
+        sync: false  # Set manually in Render dashboard
+      - key: GOOGLE_CREDENTIALS
+        sync: false  # Set manually in Render dashboard (JSON string)
+      - key: NODE_ENV
+        value: production
