@@ -6,22 +6,22 @@ const axios = require('axios');
 // ============================================
 const CONFIG = {
   ghl: {
-    apiKey: process.env.GHL_API_KEY,
     apiVersion: '2021-07-28',
     baseUrl: 'https://services.leadconnectorhq.com'
   },
   google: {
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    credentialsJson: process.env.GOOGLE_CREDENTIALS // JSON string of service account
+    credentialsJson: process.env.GOOGLE_CREDENTIALS
   },
-  locations: {
-    'xXV3CXt5DkgfGnTt8CG1': 'Springfield',
-    'uflpfHNpByAnaBLkQzu3': 'Salem',
-    'g75BBgiSvlCRbvxYRMAb': 'Keizer',
-    'NNTZT21fPm3SxpLg8s04': 'Eugene',
-    'aqSDfuZLimMXuPz6Zx3p': 'Clackamas',
-    'BQfUepBFzqVan4ruCQ6R': 'Milwaukie'
-  },
+  // Each location with its own API key environment variable
+  locations: [
+    { id: 'xXV3CXt5DkgfGnTt8CG1', name: 'Springfield', apiKeyEnv: 'GHL_API_KEY_SPRINGFIELD' },
+    { id: 'uflpfHNpByAnaBLkQzu3', name: 'Salem', apiKeyEnv: 'GHL_API_KEY_SALEM' },
+    { id: 'g75BBgiSvlCRbvxYRMAb', name: 'Keizer', apiKeyEnv: 'GHL_API_KEY_KEIZER' },
+    { id: 'NNTZT21fPm3SxpLg8s04', name: 'Eugene', apiKeyEnv: 'GHL_API_KEY_EUGENE' },
+    { id: 'aqSDfuZLimMXuPz6Zx3p', name: 'Clackamas', apiKeyEnv: 'GHL_API_KEY_CLACKAMAS' },
+    { id: 'BQfUepBFzqVan4ruCQ6R', name: 'Milwaukie', apiKeyEnv: 'GHL_API_KEY_MILWAUKIE' }
+  ],
   // Custom field keys (from GHL contact object)
   customFields: {
     saleTeamMember: 'sale_team_member',
@@ -29,8 +29,8 @@ const CONFIG = {
     sameDaySale: 'same_day_sale',
     dayOneBooked: 'day_one_booked'
   },
-  saleTag: 'sale', // Tag name to filter by
-  daysBack: 60 // How many days of data to pull
+  saleTag: 'sale',
+  daysBack: 60
 };
 
 // ============================================
@@ -49,19 +49,18 @@ class GHLClient {
     });
   }
 
-  async getContacts(locationId, startDate) {
+  async getContacts(locationId, locationName, startDate) {
     const contacts = [];
     let nextPageUrl = null;
     let page = 1;
 
-    console.log(`  Fetching contacts for location ${CONFIG.locations[locationId]}...`);
+    console.log(`  Fetching contacts for ${locationName}...`);
 
     do {
       try {
         const params = {
           locationId,
-          limit: 100,
-          query: CONFIG.saleTag // Search for contacts with sale tag
+          limit: 100
         };
 
         if (nextPageUrl) {
@@ -82,13 +81,13 @@ class GHLClient {
           });
 
           contacts.push(...filtered);
-          console.log(`    Page ${page}: ${filtered.length} contacts with sale tag`);
+          console.log(`    Page ${page}: Found ${data.contacts.length} contacts, ${filtered.length} with sale tag in date range`);
         }
 
         nextPageUrl = data.meta?.nextPageUrl || data.meta?.startAfterId || null;
         page++;
 
-        // Rate limiting - GHL allows 100 requests per minute
+        // Rate limiting
         await this.sleep(100);
 
       } catch (error) {
@@ -102,7 +101,7 @@ class GHLClient {
       }
     } while (nextPageUrl);
 
-    console.log(`  Total contacts found: ${contacts.length}`);
+    console.log(`  Total contacts found for ${locationName}: ${contacts.length}`);
     return contacts;
   }
 
@@ -155,20 +154,6 @@ class SheetsClient {
 
     console.log(`  Wrote ${data.length} rows to ${sheetName}`);
   }
-
-  async updateTeamMembersList(sheetName, range, members) {
-    const sheets = await this.getSheets();
-    
-    // Write team members list for dashboard dynamic lookup
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: this.spreadsheetId,
-      range: `${sheetName}!${range}`,
-      valueInputOption: 'USER_ENTERED',
-      resource: { values: members.map(m => [m]) }
-    });
-
-    console.log(`  Updated team members list: ${members.length} members`);
-  }
 }
 
 // ============================================
@@ -176,7 +161,7 @@ class SheetsClient {
 // ============================================
 function transformContactToRow(contact, locationName) {
   const getCustomField = (fieldName) => {
-    // Try direct property access first (varies by GHL setup)
+    // Try direct property access first
     if (contact[fieldName]) return contact[fieldName];
     
     // Try customFields array
@@ -201,12 +186,12 @@ function transformContactToRow(contact, locationName) {
     locationName,
     `${contact.firstName || ''} ${contact.lastName || ''}`.trim(),
     contact.email || '',
-    signupDate.toISOString().split('T')[0], // YYYY-MM-DD
+    signupDate.toISOString().split('T')[0],
     getCustomField(CONFIG.customFields.tourTeamMember),
     getCustomField(CONFIG.customFields.saleTeamMember),
     getCustomField(CONFIG.customFields.sameDaySale) || 'No',
     getCustomField(CONFIG.customFields.dayOneBooked) || 'No',
-    'Yes', // Has sale tag (we filtered for this)
+    'Yes',
     monthNames[signupDate.getMonth()],
     signupDate.getFullYear()
   ];
@@ -217,8 +202,8 @@ function extractUniqueTeamMembers(rows) {
   const tourMembers = new Set();
 
   rows.forEach(row => {
-    if (row[6]) saleMembers.add(row[6]); // Sale Team Member column
-    if (row[5]) tourMembers.add(row[5]); // Tour Team Member column
+    if (row[6]) saleMembers.add(row[6]);
+    if (row[5]) tourMembers.add(row[5]);
   });
 
   return {
@@ -237,11 +222,9 @@ async function syncGHLToSheets() {
   console.log('========================================\n');
 
   // Validate environment variables
-  if (!CONFIG.ghl.apiKey) throw new Error('GHL_API_KEY not set');
   if (!CONFIG.google.spreadsheetId) throw new Error('GOOGLE_SHEET_ID not set');
   if (!CONFIG.google.credentialsJson) throw new Error('GOOGLE_CREDENTIALS not set');
 
-  const ghl = new GHLClient(CONFIG.ghl.apiKey);
   const sheets = new SheetsClient(CONFIG.google.credentialsJson, CONFIG.google.spreadsheetId);
 
   // Calculate date range
@@ -252,16 +235,24 @@ async function syncGHLToSheets() {
   // Fetch contacts from all locations
   const allRows = [];
 
-  for (const [locationId, locationName] of Object.entries(CONFIG.locations)) {
-    console.log(`\nProcessing ${locationName}...`);
+  for (const location of CONFIG.locations) {
+    console.log(`\nProcessing ${location.name}...`);
+    
+    const apiKey = process.env[location.apiKeyEnv];
+    
+    if (!apiKey) {
+      console.error(`  Skipping ${location.name}: ${location.apiKeyEnv} not set`);
+      continue;
+    }
     
     try {
-      const contacts = await ghl.getContacts(locationId, startDate);
-      const rows = contacts.map(c => transformContactToRow(c, locationName));
+      const ghl = new GHLClient(apiKey);
+      const contacts = await ghl.getContacts(location.id, location.name, startDate);
+      const rows = contacts.map(c => transformContactToRow(c, location.name));
       allRows.push(...rows);
       console.log(`  Transformed ${rows.length} contacts`);
     } catch (error) {
-      console.error(`  Failed to process ${locationName}: ${error.message}`);
+      console.error(`  Failed to process ${location.name}: ${error.message}`);
     }
   }
 
@@ -275,12 +266,8 @@ async function syncGHLToSheets() {
 
   // Extract and update team members lists
   const { saleMembers, tourMembers } = extractUniqueTeamMembers(allRows);
-  console.log(`\nUnique Sale Team Members: ${saleMembers.join(', ')}`);
-  console.log(`Unique Tour Team Members: ${tourMembers.join(', ')}`);
-
-  // Optionally update a "Team Members" sheet for dashboard dropdowns
-  // await sheets.updateTeamMembersList('Team Members', 'A2', saleMembers);
-  // await sheets.updateTeamMembersList('Team Members', 'B2', tourMembers);
+  console.log(`\nUnique Sale Team Members: ${saleMembers.join(', ') || '(none)'}`);
+  console.log(`Unique Tour Team Members: ${tourMembers.join(', ') || '(none)'}`);
 
   console.log('\n========================================');
   console.log(`Sync completed at: ${new Date().toISOString()}`);
